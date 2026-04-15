@@ -1,0 +1,5 @@
+REPO nextjs-backend-stripe
+LOAD nextjs-backend-stripe.yaml
+ENTRY nextjs-backend-stripe/nextjs-backend-stripe-stack
+SECRET postgres-password stripe-secret-key stripe-publishable-key stripe-webhook-secret
+IMAGE nextjs-backend-stripe:latest nextjs-backend-stripe/app . Dockerfile
