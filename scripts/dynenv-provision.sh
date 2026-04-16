@@ -19,6 +19,8 @@ for var in CLUSTER_NAME ENVIRONMENT_NAME MONK_CAPSULE_TOKEN MONK_SUBSCRIPTION_AP
 done
 
 AUTH_HEADER="Authorization: Bearer $MONK_CAPSULE_TOKEN"
+REGISTRY_READY_TIMEOUT_SECONDS="${REGISTRY_READY_TIMEOUT_SECONDS:-180}"
+REGISTRY_READY_POLL_SECONDS="${REGISTRY_READY_POLL_SECONDS:-10}"
 
 # Mint a short-lived JIT CLI token from the capsule master token
 mint_jit_token() {
@@ -48,6 +50,80 @@ if [ -z "$MONK_JIT_CLI_TOKEN" ] || [ "$MONK_JIT_CLI_TOKEN" = "null" ]; then
     exit 1
 fi
 printf "${GREEN}JIT CLI token minted.${NC}\n"
+
+MONKD_STARTED=false
+
+ensure_local_monkd() {
+    if [ "$MONKD_STARTED" = "true" ]; then
+        return 0
+    fi
+    printf "${GREEN}Starting Monk daemon...${NC}\n"
+    monkd > /tmp/monkd.log 2>&1 &
+    printf "${GREEN}Waiting for daemon to initialize (up to 60s)...${NC}\n"
+    MONK_WAIT_ELAPSED=0
+    while [ $MONK_WAIT_ELAPSED -lt 60 ]; do
+        if monk --no-interactive --nofancy --nocolor --json version > /dev/null 2>&1; then
+            printf "${GREEN}Daemon responded after ${MONK_WAIT_ELAPSED}s.${NC}\n"
+            MONKD_STARTED=true
+            sleep 5
+            return 0
+        fi
+        sleep 2
+        MONK_WAIT_ELAPSED=$((MONK_WAIT_ELAPSED + 2))
+    done
+    printf "${RED}Daemon failed to start within 60s. Log:${NC}\n"
+    cat /tmp/monkd.log 2>/dev/null || true
+    return 1
+}
+
+cleanup_stale_cluster() {
+    local stale_cluster_id="$1"
+    local stale_monkcode="$2"
+    local stale_reason="$3"
+
+    [ -n "$stale_cluster_id" ] || return 0
+
+    printf "${YELLOW}Cleaning up stale cluster %s (%s)...${NC}\n" "$stale_cluster_id" "$stale_reason"
+    if [ -n "$stale_monkcode" ]; then
+        if ensure_local_monkd; then
+            if monk cluster join --monkcode "$stale_monkcode" --local-name "stale-cleanup-$$" >/tmp/stale_cluster_join.json 2>/tmp/stale_cluster_join.err; then
+                monk cluster nuke --force --remove-volumes --remove-snapshots >/tmp/stale_cluster_nuke.json 2>/tmp/stale_cluster_nuke.err || {
+                    printf "${YELLOW}Warning: Failed to nuke stale cluster %s. Continuing with backend cleanup.${NC}\n" "$stale_cluster_id"
+                    cat /tmp/stale_cluster_nuke.err 2>/dev/null || true
+                }
+            else
+                printf "${YELLOW}Warning: Failed to join stale cluster %s for cleanup. Continuing with backend cleanup.${NC}\n" "$stale_cluster_id"
+                cat /tmp/stale_cluster_join.err 2>/dev/null || true
+            fi
+        else
+            printf "${YELLOW}Warning: Could not start local monkd for stale cluster cleanup. Continuing with backend cleanup only.${NC}\n"
+        fi
+    fi
+
+    curl -s -o /tmp/stale_cluster_delete_response.json -w "%{http_code}" -X DELETE \
+        "$MONK_SUBSCRIPTION_API_BASE/orgs/$MONK_ORG_SLUG/clusters/$stale_cluster_id" \
+        -H "$AUTH_HEADER" >/tmp/stale_cluster_delete_http_code.txt 2>/dev/null || true
+    STALE_DELETE_HTTP_CODE=$(cat /tmp/stale_cluster_delete_http_code.txt 2>/dev/null || true)
+    if [ -n "$STALE_DELETE_HTTP_CODE" ] && [ "$STALE_DELETE_HTTP_CODE" -ge 200 ] && [ "$STALE_DELETE_HTTP_CODE" -lt 300 ]; then
+        printf "${GREEN}Removed stale backend cluster record %s.${NC}\n" "$stale_cluster_id"
+    elif [ -n "$STALE_DELETE_HTTP_CODE" ] && [ "$STALE_DELETE_HTTP_CODE" != "404" ]; then
+        printf "${YELLOW}Warning: Failed to delete stale backend cluster record %s (HTTP %s).${NC}\n" "$stale_cluster_id" "$STALE_DELETE_HTTP_CODE"
+        cat /tmp/stale_cluster_delete_response.json 2>/dev/null || true
+    fi
+}
+
+print_registry_diagnostics() {
+    local registry_address="$1"
+    printf "${YELLOW}Registry diagnostics for %s:${NC}\n" "$registry_address"
+    printf "${YELLOW}- cluster peers${NC}\n"
+    monk --json cluster peers 2>/tmp/registry_diag_peers.err || cat /tmp/registry_diag_peers.err 2>/dev/null || true
+    printf "${YELLOW}- running workloads${NC}\n"
+    monk --json ps 2>/tmp/registry_diag_ps.err || cat /tmp/registry_diag_ps.err 2>/dev/null || true
+    printf "${YELLOW}- registry /v2/ probe${NC}\n"
+    curl -skS -o /tmp/registry_probe_body.txt -D /tmp/registry_probe_headers.txt -w "HTTP %{http_code}\n" "https://$registry_address/v2/" || true
+    cat /tmp/registry_probe_headers.txt 2>/dev/null || true
+    cat /tmp/registry_probe_body.txt 2>/dev/null || true
+}
 
 # Best-effort: sync backend cluster members into Monk cluster users.
 sync_cluster_users() {
@@ -247,6 +323,32 @@ if [ "$USE_EXISTING_CLUSTER" != "true" ] && [ "$ENV_EXISTS" != "true" ]; then
     fi
 fi
 
+if [ "$USE_EXISTING_CLUSTER" != "true" ]; then
+    if [ -n "$ENV_CLUSTER_ID" ] && [ "$ENV_CLUSTER_ID" != "$CLUSTER_ID" ]; then
+        cleanup_stale_cluster "$ENV_CLUSTER_ID" "$MONKCODE" "environment linked to unusable cluster"
+        ENV_CLUSTER_ID=""
+        MONKCODE=""
+    fi
+
+    printf "${GREEN}Checking for additional stale cluster records for environment %s...${NC}\n" "$ENVIRONMENT_NAME"
+    CLUSTERS_HTTP_CODE=$(curl -s -o /tmp/stale_clusters_response.json -w "%{http_code}" \
+        "$MONK_SUBSCRIPTION_API_BASE/orgs/$MONK_ORG_SLUG/clusters" \
+        -H "$AUTH_HEADER")
+    if [ "$CLUSTERS_HTTP_CODE" -ge 200 ] && [ "$CLUSTERS_HTTP_CODE" -lt 300 ]; then
+        jq -cr --arg name "$CLUSTER_NAME" --arg keep_id "$CLUSTER_ID" '
+            .[] | select((.name // "") == $name) | select((.clusterId // "") != $keep_id) | {clusterId: (.clusterId // ""), monkcode: (.monkcode // "")} | @base64
+        ' /tmp/stale_clusters_response.json | while IFS= read -r encoded; do
+            [ -z "$encoded" ] && continue
+            stale_row="$(printf "%s" "$encoded" | base64 -d)"
+            stale_cluster_id="$(printf "%s" "$stale_row" | jq -r '.clusterId // empty')"
+            stale_monkcode="$(printf "%s" "$stale_row" | jq -r '.monkcode // empty')"
+            cleanup_stale_cluster "$stale_cluster_id" "$stale_monkcode" "duplicate cluster name for environment"
+        done
+    else
+        printf "${YELLOW}Warning: Failed to inspect stale cluster records (HTTP $CLUSTERS_HTTP_CODE). Continuing.${NC}\n"
+    fi
+fi
+
 if [ "$USE_EXISTING_CLUSTER" = "true" ]; then
     printf "${GREEN}Connecting to existing cluster via MONK_SOCKET...${NC}\n"
     export MONK_SOCKET="monkcode://$MONKCODE"
@@ -274,25 +376,7 @@ fi
 if [ "$USE_EXISTING_CLUSTER" != "true" ] || [ "$REGISTRY_SETUP_REQUIRED" = "true" ]; then
     if [ "$USE_EXISTING_CLUSTER" != "true" ]; then
         unset MONK_SOCKET
-        # Start the Monk daemon in background (not running by default in CI container)
-        printf "${GREEN}Starting Monk daemon...${NC}\n"
-        monkd > /tmp/monkd.log 2>&1 &
-        printf "${GREEN}Waiting for daemon to initialize (up to 60s)...${NC}\n"
-        MONK_WAIT_ELAPSED=0
-        while [ $MONK_WAIT_ELAPSED -lt 60 ]; do
-            if monk --no-interactive --nofancy --nocolor --json version > /dev/null 2>&1; then
-                printf "${GREEN}Daemon responded after ${MONK_WAIT_ELAPSED}s.${NC}\n"
-                break
-            fi
-            sleep 2
-            MONK_WAIT_ELAPSED=$((MONK_WAIT_ELAPSED + 2))
-        done
-        if [ $MONK_WAIT_ELAPSED -ge 60 ]; then
-            printf "${RED}Daemon failed to start within 60s. Log:${NC}\n"
-            cat /tmp/monkd.log 2>/dev/null || true
-            exit 1
-        fi
-        sleep 5
+        ensure_local_monkd
 
         # A.2 Create new cluster
         printf "${GREEN}Creating new cluster: $CLUSTER_NAME...${NC}\n"
@@ -333,6 +417,10 @@ case "$CLOUD_PROVIDER" in
 esac
 
         # A.4 Grow cluster (provision instances)
+        if [ "$CLOUD_PROVIDER" = "digitalocean" ] && [ -z "$CLOUD_INSTANCE_TYPE" ]; then
+            CLOUD_INSTANCE_TYPE="s-2vcpu-4gb"
+            printf "${YELLOW}Defaulting DigitalOcean instance type to %s for improved stability.${NC}\n" "$CLOUD_INSTANCE_TYPE"
+        fi
         printf "${GREEN}Growing cluster ($CLOUD_INSTANCE_COUNT x $CLOUD_INSTANCE_TYPE in $CLOUD_REGION)...${NC}\n"
         DISK_SIZE_FLAG=""
         if [ -n "$CLOUD_DISK_SIZE" ] && [ "$CLOUD_PROVIDER" != "digitalocean" ]; then
@@ -428,19 +516,33 @@ esac
         printf "${GREEN}Registry available at: $REGISTRY_ADDRESS${NC}\n"
 
         # Wait for registry to be ready and configure docker login
+        REGISTRY_MAX_RETRIES=$((REGISTRY_READY_TIMEOUT_SECONDS / REGISTRY_READY_POLL_SECONDS))
+        [ "$REGISTRY_MAX_RETRIES" -le 0 ] && REGISTRY_MAX_RETRIES=1
         RETRIES=0
         REGISTRY_READY=false
-        while [ "$RETRIES" -lt 5 ]; do
+        while [ "$RETRIES" -lt "$REGISTRY_MAX_RETRIES" ]; do
             RETRIES=$((RETRIES + 1))
-            printf "  Waiting for registry to be ready (attempt $RETRIES/5)...\n"
-            sleep 10
+            printf "  Waiting for registry to be ready (attempt %s/%s, ~%ss timeout)...\n" "$RETRIES" "$REGISTRY_MAX_RETRIES" "$REGISTRY_READY_TIMEOUT_SECONDS"
+            REGISTRY_HTTP_CODE=$(curl -skS -o /tmp/registry_probe_body.txt -w "%{http_code}" "https://$REGISTRY_ADDRESS/v2/" || true)
+            if [ "$REGISTRY_HTTP_CODE" = "200" ] || [ "$REGISTRY_HTTP_CODE" = "401" ]; then
+                if monk registry --server "$REGISTRY_ADDRESS" -u "$REGISTRY_USERNAME" -p "$REGISTRY_PASSWORD" -a registry.local 2>/tmp/registry_login.err; then
+                    REGISTRY_READY=true
+                    break
+                fi
+                printf "${YELLOW}Registry endpoint is reachable but login is not ready yet.${NC}\n"
+                cat /tmp/registry_login.err 2>/dev/null || true
+            else
+                printf "${YELLOW}Registry probe returned HTTP %s; still waiting.${NC}\n" "${REGISTRY_HTTP_CODE:-unknown}"
+            fi
+            sleep "$REGISTRY_READY_POLL_SECONDS"
             if monk registry --server "$REGISTRY_ADDRESS" -u "$REGISTRY_USERNAME" -p "$REGISTRY_PASSWORD" -a registry.local 2>/dev/null; then
                 REGISTRY_READY=true
                 break
             fi
         done
         if [ "$REGISTRY_READY" != "true" ]; then
-            printf "${RED}Error: Registry did not become ready in time${NC}\n"
+            printf "${RED}Error: Registry did not become ready within %ss${NC}\n" "$REGISTRY_READY_TIMEOUT_SECONDS"
+            print_registry_diagnostics "$REGISTRY_ADDRESS"
             exit 1
         fi
         printf "${GREEN}Docker login configured for registry.${NC}\n"
