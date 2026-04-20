@@ -1,0 +1,104 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: testcapsule
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  login:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: login
+    ports:
+      - "8081:8080"
+    environment:
+      PORT: "8080"
+      JWT_SECRET: dev-secret
+      ENVIRONMENT: development
+
+  platform:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: platform
+    ports:
+      - "8082:8080"
+    environment:
+      PORT: "8080"
+      JWT_SECRET: dev-secret
+      CORE_SERVICE_URL: http://core:8080
+      ENVIRONMENT: development
+    depends_on:
+      - core
+
+  core:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: core
+    ports:
+      - "8083:8080"
+    environment:
+      PORT: "8080"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/testcapsule?sslmode=disable
+      JWT_SECRET: dev-secret
+      ENVIRONMENT: development
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: api
+    ports:
+      - "8080:8080"
+    environment:
+      PORT: "8080"
+      CORE_SERVICE_URL: http://core:8080
+      ENVIRONMENT: development
+    depends_on:
+      - core
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: frontend
+    ports:
+      - "3000:8080"
+    environment:
+      PORT: "8080"
+      LOGIN_SERVICE_URL: http://login:8080
+      PLATFORM_SERVICE_URL: http://platform:8080
+      CORE_SERVICE_URL: http://core:8080
+      API_SERVICE_URL: http://api:8080
+      ENVIRONMENT: development
+    depends_on:
+      - login
+      - platform
+      - core
+      - api
+
+volumes:
+  pgdata:

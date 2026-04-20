@@ -1,5 +1,10 @@
-REPO nextjs-backend-stripe
-LOAD nextjs-backend-stripe.yaml
-ENTRY nextjs-backend-stripe/nextjs-backend-stripe-stack
-SECRET postgres-password stripe-secret-key stripe-publishable-key stripe-webhook-secret
-IMAGE nextjs-backend-stripe:latest nextjs-backend-stripe/app . Dockerfile
+REPO test-capsule
+LOAD test-capsule.yaml
+ENTRY test-capsule/local
+IMAGE api:latest test-capsule/api . Dockerfile
+IMAGE core:latest test-capsule/core . Dockerfile
+IMAGE frontend:latest test-capsule/frontend . Dockerfile
+IMAGE login:latest test-capsule/login . Dockerfile
+IMAGE platform:latest test-capsule/platform . Dockerfile
+BLOBS migrations:migrations
+BLOBSIGNORE .git .DS_Store node_modules

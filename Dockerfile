@@ -1,27 +1,29 @@
-FROM node:24-alpine AS deps
+FROM golang:1.25-alpine AS builder
 WORKDIR /app
-ENV NEXT_TELEMETRY_DISABLED=1
-COPY package.json package-lock.json ./
-RUN npm ci
 
-FROM node:24-alpine AS builder
-WORKDIR /app
-ENV NEXT_TELEMETRY_DISABLED=1
-COPY --from=deps /app/node_modules ./node_modules
+COPY go.mod go.sum ./
+RUN go mod download
+
 COPY . .
-RUN npm run build
 
-FROM node:24-alpine AS runner
-WORKDIR /app
-ENV NODE_ENV=production
-ENV NEXT_TELEMETRY_DISABLED=1
-ENV PORT=3000
-ENV HOSTNAME=0.0.0.0
+RUN CGO_ENABLED=0 GOOS=linux go build -o /bin/login ./cmd/login \
+ && CGO_ENABLED=0 GOOS=linux go build -o /bin/platform ./cmd/platform \
+ && CGO_ENABLED=0 GOOS=linux go build -o /bin/core ./cmd/core \
+ && CGO_ENABLED=0 GOOS=linux go build -o /bin/api ./cmd/api \
+ && CGO_ENABLED=0 GOOS=linux go build -o /bin/frontend ./cmd/frontend
 
-COPY --from=builder /app/public ./public
-COPY --from=builder /app/.next/standalone ./
-COPY --from=builder /app/.next/static ./.next/static
+FROM alpine:3.19
+RUN apk add --no-cache ca-certificates
 
-EXPOSE 3000
+ARG SERVICE=platform
 
-CMD ["node", "server.js"]
+COPY --from=builder /bin/login /bin/login
+COPY --from=builder /bin/platform /bin/platform
+COPY --from=builder /bin/core /bin/core
+COPY --from=builder /bin/api /bin/api
+COPY --from=builder /bin/frontend /bin/frontend
+
+ENV SERVICE=${SERVICE}
+EXPOSE 8080
+
+ENTRYPOINT ["/bin/sh", "-c", "exec /bin/${SERVICE}"]
