@@ -1,0 +1,400 @@
+namespace: test-capsule
+
+postgres:
+  defines: runnable
+  volumes:
+    data:
+      kind: local
+      size: 10
+  containers:
+    postgres:
+      image: postgres:16-alpine
+      mounted-volumes:
+        data:
+          path: /var/lib/postgresql/data
+  services:
+    postgres:
+      container: postgres
+      port: 5432
+      protocol: tcp
+      publish: true
+      host-port: 5432
+  checks:
+    readiness:
+      code: tcp-check-service("test-capsule/postgres", "postgres")
+      period: 10
+      initialDelay: 10
+      attempts: 12
+  variables:
+    postgres-db:
+      type: string
+      value: testcapsule
+      env: POSTGRES_DB
+    postgres-user:
+      type: string
+      value: postgres
+      env: POSTGRES_USER
+    postgres-password:
+      type: string
+      value: postgres
+      env: POSTGRES_PASSWORD
+
+db-migrate:
+  defines: runnable
+  containers:
+    migrate:
+      image: postgres:16-alpine
+      restart: "no"
+      paths:
+        - blobs://migrations:/migrations:ro
+      bash: |
+        set -e
+        until pg_isready -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE"; do
+          sleep 2
+        done
+        for file in /migrations/*.sql; do
+          [ -f "$file" ] || exit 0
+          psql -v ON_ERROR_STOP=1 -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" -f "$file"
+        done
+  services: {}
+  connections:
+    postgres:
+      target: test-capsule/postgres
+      service: postgres
+  depends:
+    wait-for:
+      runnables:
+        - test-capsule/postgres
+      timeout: 180
+  variables:
+    pg-host:
+      type: string
+      value: <- connection-hostname("postgres")
+      env: PGHOST
+    pg-port:
+      type: int
+      value: <- connection-port("postgres")
+      env: PGPORT
+    pg-database:
+      type: string
+      value: testcapsule
+      env: PGDATABASE
+    pg-user:
+      type: string
+      value: postgres
+      env: PGUSER
+    pg-password:
+      type: string
+      value: postgres
+      env: PGPASSWORD
+
+login:
+  defines: runnable
+  containers:
+    login:
+      image: login:latest
+      bash: |
+        exec /bin/login
+  services:
+    http:
+      container: login
+      port: 8080
+      protocol: tcp
+      publish: true
+      host-port: 8081
+  checks:
+    readiness:
+      code: http-get-service("test-capsule/login", "http", "/auth/health") get-member("status") 200 eq?
+      period: 10
+      initialDelay: 5
+      attempts: 12
+    liveness:
+      code: http-get-service("test-capsule/login", "http", "/auth/health") get-member("status") 200 eq?
+      period: 30
+      initialDelay: 10
+      attempts: 6
+  variables:
+    port:
+      type: string
+      value: "8080"
+      env: PORT
+    jwt-secret:
+      type: string
+      value: dev-secret
+      env: JWT_SECRET
+    environment:
+      type: string
+      value: development
+      env: ENVIRONMENT
+
+core:
+  defines: runnable
+  containers:
+    core:
+      image: core:latest
+      bash: |
+        exec /bin/core
+  services:
+    http:
+      container: core
+      port: 8080
+      protocol: tcp
+      publish: true
+      host-port: 8083
+  connections:
+    postgres:
+      target: test-capsule/postgres
+      service: postgres
+  depends:
+    wait-for:
+      runnables:
+        - test-capsule/postgres
+        - test-capsule/db-migrate
+      timeout: 180
+  checks:
+    readiness:
+      code: http-get-service("test-capsule/core", "http", "/core/health") get-member("status") 200 eq?
+      period: 10
+      initialDelay: 10
+      attempts: 18
+    liveness:
+      code: http-get-service("test-capsule/core", "http", "/core/health") get-member("status") 200 eq?
+      period: 30
+      initialDelay: 15
+      attempts: 6
+  variables:
+    port:
+      type: string
+      value: "8080"
+      env: PORT
+    database-url:
+      type: string
+      env: DATABASE_URL
+      value: >-
+        <- "postgres://postgres:postgres@"
+        connection-hostname("postgres")
+        ":"
+        connection-port("postgres")
+        "/testcapsule?sslmode=disable"
+        concat-all
+    jwt-secret:
+      type: string
+      value: dev-secret
+      env: JWT_SECRET
+    environment:
+      type: string
+      value: development
+      env: ENVIRONMENT
+
+platform:
+  defines: runnable
+  containers:
+    platform:
+      image: platform:latest
+      bash: |
+        exec /bin/platform
+  services:
+    http:
+      container: platform
+      port: 8080
+      protocol: tcp
+      publish: true
+      host-port: 8082
+  connections:
+    core:
+      target: test-capsule/core
+      service: http
+  depends:
+    wait-for:
+      runnables:
+        - test-capsule/core
+      timeout: 180
+  checks:
+    readiness:
+      code: http-get-service("test-capsule/platform", "http", "/platform/health") get-member("status") 200 eq?
+      period: 10
+      initialDelay: 10
+      attempts: 18
+    liveness:
+      code: http-get-service("test-capsule/platform", "http", "/platform/health") get-member("status") 200 eq?
+      period: 30
+      initialDelay: 15
+      attempts: 6
+  variables:
+    port:
+      type: string
+      value: "8080"
+      env: PORT
+    core-service-url:
+      type: string
+      env: CORE_SERVICE_URL
+      value: >-
+        <- "http://"
+        connection-hostname("core")
+        ":"
+        connection-port("core")
+        concat-all
+    jwt-secret:
+      type: string
+      value: dev-secret
+      env: JWT_SECRET
+    environment:
+      type: string
+      value: development
+      env: ENVIRONMENT
+
+api:
+  defines: runnable
+  containers:
+    api:
+      image: api:latest
+      bash: |
+        exec /bin/api
+  services:
+    http:
+      container: api
+      port: 8080
+      protocol: tcp
+      publish: true
+      host-port: 8080
+  connections:
+    core:
+      target: test-capsule/core
+      service: http
+  depends:
+    wait-for:
+      runnables:
+        - test-capsule/core
+      timeout: 180
+  checks:
+    readiness:
+      code: http-get-service("test-capsule/api", "http", "/api/health") get-member("status") 200 eq?
+      period: 10
+      initialDelay: 10
+      attempts: 18
+    liveness:
+      code: http-get-service("test-capsule/api", "http", "/api/health") get-member("status") 200 eq?
+      period: 30
+      initialDelay: 15
+      attempts: 6
+  variables:
+    port:
+      type: string
+      value: "8080"
+      env: PORT
+    core-service-url:
+      type: string
+      env: CORE_SERVICE_URL
+      value: >-
+        <- "http://"
+        connection-hostname("core")
+        ":"
+        connection-port("core")
+        concat-all
+    environment:
+      type: string
+      value: development
+      env: ENVIRONMENT
+
+frontend:
+  defines: runnable
+  containers:
+    frontend:
+      image: frontend:latest
+      bash: |
+        exec /bin/frontend
+  services:
+    http:
+      container: frontend
+      port: 8080
+      protocol: tcp
+      publish: true
+      host-port: 3000
+  connections:
+    login:
+      target: test-capsule/login
+      service: http
+    platform:
+      target: test-capsule/platform
+      service: http
+    core:
+      target: test-capsule/core
+      service: http
+    api:
+      target: test-capsule/api
+      service: http
+  depends:
+    wait-for:
+      runnables:
+        - test-capsule/login
+        - test-capsule/platform
+        - test-capsule/core
+        - test-capsule/api
+      timeout: 240
+  checks:
+    readiness:
+      code: http-get-service("test-capsule/frontend", "http", "/health") get-member("status") 200 eq?
+      period: 10
+      initialDelay: 10
+      attempts: 18
+    liveness:
+      code: http-get-service("test-capsule/frontend", "http", "/status") get-member("status") 200 eq?
+      period: 30
+      initialDelay: 15
+      attempts: 6
+  variables:
+    port:
+      type: string
+      value: "8080"
+      env: PORT
+    login-service-url:
+      type: string
+      env: LOGIN_SERVICE_URL
+      value: >-
+        <- "http://"
+        connection-hostname("login")
+        ":"
+        connection-port("login")
+        concat-all
+    platform-service-url:
+      type: string
+      env: PLATFORM_SERVICE_URL
+      value: >-
+        <- "http://"
+        connection-hostname("platform")
+        ":"
+        connection-port("platform")
+        concat-all
+    core-service-url:
+      type: string
+      env: CORE_SERVICE_URL
+      value: >-
+        <- "http://"
+        connection-hostname("core")
+        ":"
+        connection-port("core")
+        concat-all
+    api-service-url:
+      type: string
+      env: API_SERVICE_URL
+      value: >-
+        <- "http://"
+        connection-hostname("api")
+        ":"
+        connection-port("api")
+        concat-all
+    environment:
+      type: string
+      value: development
+      env: ENVIRONMENT
+
+local:
+  defines: group
+  members:
+    - test-capsule/postgres
+    - test-capsule/db-migrate
+    - test-capsule/login
+    - test-capsule/core
+    - test-capsule/platform
+    - test-capsule/api
+    - test-capsule/frontend
