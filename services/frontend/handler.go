@@ -315,6 +315,7 @@ function switchTab(tab) {
 }
 
 function loadTab() {
+  clearInterval(stTimer);
   const c = $('tc'); if (!c) return;
   c.innerHTML = '<div style="color:#475569;padding:.5rem">Loading…</div>';
   ({status:loadStatus, dashboard:loadDashboard, users:loadUsers, resources:loadResources}[S.tab] || (()=>{}))();
